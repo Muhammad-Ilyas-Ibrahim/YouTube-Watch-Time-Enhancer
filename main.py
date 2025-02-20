@@ -76,7 +76,7 @@ def scrape_videos_data():
         print("Page source:", page_source[:500])  # Print first 500 chars for debugging
 
 def send_to_discord(msg):
-    webhook_url='https://discord.com/api/webhooks/1342207558538100911/oBXL48I9Bs5gFkHFRzfgWtpqVHM-AHi6O_7AvLHZAc_joEvYRBVIepbi-dBMFb3CSsEP'
+    webhook_url=''
 
     # The message you want to send
     message = {
