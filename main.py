@@ -6,142 +6,284 @@ from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager 
 from bs4 import BeautifulSoup
 import yt_dlp
+import requests
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
-# Global Variables 
+USERNAME = os.environ.get('USERNAME')
 url_file = 'scraped_videos.csv'
-channel_url_1 = "https://www.youtube.com/@techwizard137/videos"
-channel_url_2 = "https://www.youtube.com/@360sakuragaming/videos"
-
-base_url = "https://youtube.com"
-global page_source
-global scraped_data
+channel_url_1 = 'https://www.youtube.com/@360sakuragaming/videos'
+channel_url_2 = 'https://www.youtube.com/@techwizard137/videos'  
 scraped_data = []
+csv_lock = Lock()
+driver = None
+
+def get_video_duration(url):
+    ydl_opts = {
+        'quiet': True,
+        'extract_flat': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            return info.get('duration', 0)
+        except Exception as e:
+            print(f"Error getting video duration: {e}")
+            return 0
 
 def open_channel_and_retrieve_page_source(channel_url):
-    global page_source
+    try:
+        chrome_options = Options()
+        # chrome_options.add_argument("--headless")
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.get(channel_url)
+        time.sleep(5)  # Let the page load
+        page_source = driver.page_source
+        driver.quit()
+        return page_source
+    except Exception as e:
+        print(f"Error retrieving page source: {e}")
+        return None
+
+def scrape_videos_data():
+    global scraped_data
+    try:
+        page_source = driver.page_source
+        soup = BeautifulSoup(page_source, 'html.parser')
+        
+        # Find video elements (try multiple selectors as YouTube's structure might vary)
+        video_elements = soup.find_all('a', id='video-title-link')
+        if not video_elements:
+            video_elements = soup.find_all('a', {'class': 'yt-simple-endpoint'})
+        
+        print(f"Found {len(video_elements)} video elements in the page")
+        
+        for video in video_elements:
+            title = video.get('title', '').strip()
+            href = video.get('href', '')
+            if href and title and 'watch?v=' in href:
+                full_url = f"https://youtube.com{href}"
+                print(f"Found video: {title}")
+                scraped_data.append([title, full_url])
+        
+        print(f"Successfully processed {len(scraped_data)} videos")
+        
+    except Exception as e:
+        print(f"Error in scrape_videos_data: {str(e)}")
+        print("Page source:", page_source[:500])  # Print first 500 chars for debugging
+
+def send_to_discord(msg):
+    webhook_url='https://discord.com/api/webhooks/1342207558538100911/oBXL48I9Bs5gFkHFRzfgWtpqVHM-AHi6O_7AvLHZAc_joEvYRBVIepbi-dBMFb3CSsEP'
+
+    # The message you want to send
+    message = {
+        "content": f"{msg}",
+        "username": f"{USERNAME}"
+    }
+
+    # Convert the message to JSON format
+    data = json.dumps(message)
+
+    # Set the headers to specify that the content type is JSON
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    # Send the POST request to the webhook URL
+    response = requests.post(webhook_url, data=data, headers=headers)
+
+    # Check the response status
+    if response.status_code == 204:
+        print("Message sent successfully!")
+    else:
+        print(f"Failed to send message. Status code: {response.status_code}")
+
+def delete_row_from_csv(url):
+    df = pd.read_csv(url_file)
+    df = df[df['URLs'] != url]
+    if len(df) == 0:
+        os.remove(url_file)
+        return True
+    df.to_csv(url_file, index=False)
+    return False
+
+def split_video_into_chunks(video_url, video_title, duration):
+    chunk_duration = 1200  # 20 minutes in seconds
+    chunks = []
+    
+    if duration > chunk_duration:
+        num_chunks = (duration + chunk_duration - 1) // chunk_duration
+        for i in range(num_chunks):
+            time_param = f"&t={i * chunk_duration}s" if i > 0 else ""
+            chunk_url = f"{video_url}{time_param}"
+            chunks.append([f"{video_title} (Part {i+1})", chunk_url])
+        
+        # Save chunks to CSV immediately
+        create_or_prepend_to_csv(chunks, url_file)
+    else:
+        chunks.append([video_title, video_url])
+        create_or_prepend_to_csv([[video_title, video_url]], url_file)
+
+    print(f"Chunks: {chunks}")
+    return chunks
+
+def create_or_prepend_to_csv(new_data, filename):
+    if not new_data:
+        return
+        
+    with csv_lock:
+        if os.path.exists(filename):
+            existing_df = pd.read_csv(filename)
+            new_df = pd.DataFrame(new_data, columns=['Title', 'URLs'])
+            combined_df = pd.concat([new_df, existing_df], ignore_index=True)
+            combined_df.to_csv(filename, index=False)
+        else:
+            new_df = pd.DataFrame(new_data, columns=['Title', 'URLs'])
+            new_df.to_csv(filename, index=False)
+
+def scroll_and_wait(driver, scroll_times=5):
+    for _ in range(scroll_times):
+        # Scroll to bottom
+        driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
+        time.sleep(2)  # Wait for content to load
+
+def process_video(video_data):
+    title, url = video_data
+    print(f"Getting duration for: {title}")
+    duration = get_video_duration(url)
+    if duration:
+        return split_video_into_chunks(url, title, duration)
+    print(f"Could not get duration for: {title}")
+    return None
+
+def watch_videos():
+    if not os.path.exists(url_file):
+        if not channel_url_1 and not channel_url_2:
+            print("Please set channel_url_1 and/or channel_url_2 before running")
+            return
+            
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        service = Service(ChromeDriverManager().install())
+        global driver
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        driver.set_window_size(1920, 1080)
+        
+        # Perform scraping if CSV doesn't exist
+        if channel_url_1:
+            print(f"Scraping channel 1: {channel_url_1}")
+            try:
+                driver.get(channel_url_1)
+                time.sleep(5)
+                scroll_and_wait(driver)
+                scrape_videos_data()
+            except Exception as e:
+                print(f"Error scraping channel 1: {str(e)}")
+            
+        if channel_url_2:
+            print(f"Scraping channel 2: {channel_url_2}")
+            try:
+                driver.get(channel_url_2)
+                time.sleep(5)
+                scroll_and_wait(driver)
+                scrape_videos_data()
+            except Exception as e:
+                print(f"Error scraping channel 2: {str(e)}")
+            
+        driver.quit()
+        
+        # Process videos in parallel using ThreadPoolExecutor
+        print(f"Processing {len(scraped_data)} videos found...")
+        all_chunks = []
+        max_workers = min(32, len(scraped_data))  # Use up to 32 threads
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_video = {executor.submit(process_video, video): video for video in scraped_data}
+            for future in as_completed(future_to_video):
+                video = future_to_video[future]
+                try:
+                    chunks = future.result()
+                    if chunks:
+                        all_chunks.extend(chunks)
+                except Exception as e:
+                    print(f"Error processing video {video[0]}: {str(e)}")
+        
+        # Save all chunks at once
+        if all_chunks:
+            create_or_prepend_to_csv(all_chunks, url_file)
+        
+        if not scraped_data:
+            print("No videos were found to process")
+            return
+            
+        print(f"Scraped data saved to {url_file}")
+    
+    if not os.path.exists(url_file):
+        print("No videos file was created. Please check channel URLs and try again")
+        return
+
+    # Read URLs from CSV
+    urls_df = pd.read_csv(url_file)
+    youtube_links = urls_df['URLs'].tolist()
+    titles = urls_df['Title'].tolist()
+
+    # Set up Chrome options with muted audio
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--disable-extensions")
-    
-    # Automatically download and set up ChromeDriver using webdriver-manager
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    chrome_options.add_argument("--mute-audio")
 
-    # Open the YouTube channel page
-    driver.get(channel_url)
-
-    # Scroll to the bottom of the page to load all videos
-    last_height = driver.execute_script("return document.documentElement.scrollHeight")
-    scroll_pause_time = 5  # Time to wait after scrolling
-
-    while True:
-        # Scroll down to the bottom
-        driver.execute_script("window.scrollTo(0, document.documentElement.scrollHeight);")
-
-        # Wait to load the new content
-        time.sleep(scroll_pause_time)
-
-        # Calculate new scroll height and compare with the last height
-        new_height = driver.execute_script("return document.documentElement.scrollHeight")
-        if new_height == last_height:
-            break  # Exit the loop when no more new content is loaded
-        last_height = new_height
-
-    # Get page source after all videos have been loaded
-    page_source = driver.page_source
-
-    # Close the browser
-    driver.quit()
-
-def scrape_videos_data():
-    global scraped_data
-    # Use BeautifulSoup to parse the page source
-    soup = BeautifulSoup(page_source, "html.parser")
-
-    # Find all video elements
-    videos = soup.find_all('a', id='video-title-link')
-
-    # Prepare data to export
-    for video in videos:
-        video_title = video['aria-label'].split(' by ')[0]  # Extract title from 'aria-label'
-        video_url = base_url + video['href']  # Create full URL
-        scraped_data.append([video_title, video_url])
-
-
-def write_scraped_data_to_csv():
-    global scraped_data
-    # Convert the scraped data into a DataFrame
-    df = pd.DataFrame(scraped_data, columns=['Title', 'URLs'])
-    print("Number of rows: ", df.shape[0])
-    
-    # Export the DataFrame to a CSV file using pandas
-    csv_file = "scraped_videos.csv"
-    df.to_csv(csv_file, index=False, encoding='utf-8')
-
-    print(f"Scraped data saved to {csv_file}")
-
-def get_video_duration(youtube_url):
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,  # Skip the actual download
-            'extract_flat': True,  # Extract metadata only
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(youtube_url, download=False)
-            return info_dict.get('duration', None)  # Returns duration in seconds or None if not found
-
-    except Exception as e:
-        print(f"Error getting duration for {youtube_url}: {e}")
-        return None
-
-if __name__ == '__main__':
-    
-    open_channel_and_retrieve_page_source(channel_url_1)
-    scrape_videos_data()
-    open_channel_and_retrieve_page_source(channel_url_2)
-    scrape_videos_data()
-    write_scraped_data_to_csv()
-    
-    # Read URLs from CSV
-    urls_df = pd.read_csv(url_file)
-
-    # Get the list of URLs from the 'URLs' column
-    youtube_links = urls_df['URLs'].tolist()
-
-    # Set up Chrome options
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--start-maximized")  # Open browser in maximized mode
-    chrome_options.add_argument("--disable-extensions")  # Disable extensions for cleaner execution
-
-    # Automatically download and set up ChromeDriver using webdriver-manager
     service = Service(ChromeDriverManager().install())
-
-    # Initialize the WebDriver using the service and options
     driver = webdriver.Chrome(service=service, options=chrome_options)
 
-    # Loop through each YouTube video link
-    for link in youtube_links:
+    for link, title in zip(youtube_links, titles):
         try:
-            # Get video duration
-            duration = get_video_duration(link)
+            # Extract time parameter if present
+            time_param = 0
+            if "&t=" in link:
+                time_param = int(link.split("&t=")[1].replace("s", ""))
             
-            print(f'Opening {link}')
-            print("Video duration: ", duration)
+            # Get full video duration
+            base_url = link.split("&t=")[0] if "&t=" in link else link
+            full_duration = get_video_duration(base_url)
             
-            duration = int(duration)
-            
-            # Open the video using Selenium
-            driver.get(link)
-            time.sleep(5)  # Let the page load for a few seconds
-            driver.refresh()  # Refresh the page to ensure video loads properly
+            if full_duration:
+                print(f'Opening {link}')
+                
+                # Calculate remaining duration
+                remaining_duration = full_duration - time_param
+                watch_duration = min(1200, remaining_duration)
+                
+                print(f"Watching for {watch_duration} seconds")
+                send_to_discord(f'**{title}** is being played\nFull Video Duration: {full_duration}\nWatching for {watch_duration} seconds\nURL of Video: {base_url}')
+                driver.get(link)
+                time.sleep(5)  # Initial buffer
+                driver.refresh()
+                
+                # Wait for calculated duration
+                time.sleep(watch_duration)
+                
+                # Delete the watched chunk from CSV
+                if delete_row_from_csv(link):
+                    print("All videos watched. CSV file deleted.")
+                    break
 
-            # Wait for the video to finish playing
-            time.sleep(duration)
         except Exception as e:
             print(f"An error occurred with {link}: {e}")
 
-    # Close the browser after watching all videos
     driver.quit()
+
+if __name__ == "__main__":
+    while True:
+        try:
+            watch_videos()
+        except:
+            time.sleep(10)
